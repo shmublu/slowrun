@@ -51,7 +51,18 @@ parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
+parser.add_argument("--dupe-start-epoch", type=int, default=0,
+                    help="Epoch to enable layer duplication (0=3 before end)")
+parser.add_argument("--dupe-layers-start", type=int, default=15,
+                    help="First decoder layer to duplicate (inclusive)")
+parser.add_argument("--dupe-layers-end", type=int, default=21,
+                    help="Last decoder layer to duplicate (exclusive)")
+parser.add_argument("--max-train-seconds", type=float, default=0,
+                    help="Wall-clock cutoff in seconds (0=disabled)")
 args = parser.parse_args()
+
+if args.dupe_start_epoch == 0:
+    args.dupe_start_epoch = max(1, args.num_epochs - 2)
 
 # Resolve output path
 if args.output_json and not args.save_result:
@@ -88,7 +99,7 @@ SCALAR_LR = BASE_SCALAR_LR * _lr_mult
 WEIGHT_DECAY = args.weight_decay
 ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.0
-WARMDOWN_RATIO = 0.5
+WARMDOWN_RATIO = 0.4
 FINAL_LR_FRAC = 0.0
 
 # =============================================================================
@@ -249,6 +260,13 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
+        self._dupe_layers = None  # (start, end) or None
+
+    def set_dupe_layers(self, start, end):
+        assert start >= self.encoder_layers, "dupe layers must be decoder-only"
+        assert end <= self.config.n_layer
+        self._dupe_layers = (start, end)
+        print0(f"Dupe layers {start}-{end-1}: decoder layers repeated with skip connections")
 
     @torch.no_grad()
     def init_weights(self):
@@ -339,7 +357,13 @@ class GPT(nn.Module):
         x = norm(self.transformer.wte(idx))
         x0 = x
         skip_connections = []
+        skip_snapshot = None
+        dupe = self._dupe_layers
+
         for i, block in enumerate(self.transformer.h):
+            # Save skip stack snapshot right before first decoder layer
+            if dupe is not None and i == self.encoder_layers and skip_snapshot is None:
+                skip_snapshot = list(skip_connections)
             if i >= self.encoder_layers and skip_connections:
                 skip = skip_connections.pop()
                 x = x + self.skip_weights[i - self.encoder_layers] * skip
@@ -348,6 +372,16 @@ class GPT(nn.Module):
             x = block(x, ve, cos_sin, self.window_sizes[i])
             if i < self.encoder_layers:
                 skip_connections.append(x)
+            # After last dupe layer on first pass: run repeat with restored skips
+            if dupe is not None and i == dupe[1] - 1:
+                skip_connections = list(skip_snapshot)
+                for j in range(dupe[0], dupe[1]):
+                    skip = skip_connections.pop()
+                    x = x + self.skip_weights[j - self.encoder_layers] * skip
+                    x = self.resid_lambdas[j] * x + self.x0_lambdas[j] * x0
+                    ve = self.ve_projs[str(j)](x0) if str(j) in self.ve_projs else None
+                    x = self.transformer.h[j](x, ve, cos_sin, self.window_sizes[j])
+
         x = norm(x)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
         logits = 15 * torch.tanh(logits / 15)  # softcap
@@ -755,6 +789,7 @@ epochs_without_improvement = 0
 smooth_train_loss = 0
 total_training_time = 0
 eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
+dupe_active = False
 
 # Initial val evaluation
 model.eval()
@@ -766,8 +801,16 @@ wandb_run.log({"step": step, "val/bpb": val_bpb, "val/loss": val_loss})
 min_val_bpb = val_bpb
 min_val_loss = val_loss
 model.train()
+train_start = time.time()
 
 while current_epoch <= args.num_epochs:
+    if not dupe_active and current_epoch >= args.dupe_start_epoch:
+        print0(f"\n=== Enabling dupe-layers at epoch {current_epoch} ===")
+        orig_model.set_dupe_layers(args.dupe_layers_start, args.dupe_layers_end)
+        model = orig_model  # eager mode — no recompile delay
+        dupe_active = True
+        gc.enable(); gc.collect()
+
     # Training step
     synchronize()
     t0 = time.time()
@@ -803,8 +846,13 @@ while current_epoch <= args.num_epochs:
         total_training_time += dt
     steps_done = step - 10
     eta_str = f" | eta: {(num_iterations - step) * total_training_time / steps_done / 60:.1f}m" if steps_done > 0 else ""
-    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}")
+    dupe_str = " [DUPE]" if dupe_active else ""
+    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{dupe_str}{eta_str}")
     wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu})
+
+    if args.max_train_seconds > 0 and (time.time() - train_start) >= args.max_train_seconds:
+        print0(f"\n=== Wall-clock cutoff at {time.time() - train_start:.1f}s ===")
+        break
 
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
     if ddp:
@@ -840,6 +888,19 @@ while current_epoch <= args.num_epochs:
     # GC management
     if step == 1:
         gc.collect(); gc.freeze(); gc.disable()
+
+# Final val eval — always runs after training loop exits
+print0(f"\n--- Final eval (step {step}, dupe_active={dupe_active}) ---")
+model.eval()
+val_loader = build_val_loader()
+with autocast_ctx:
+    val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+dupe_str = " [DUPE]" if dupe_active else ""
+print0(f"Final Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}{dupe_str}")
+wandb_run.log({"step": step, "val/bpb": val_bpb, "val/loss": val_loss})
+if val_bpb < min_val_bpb:
+    min_val_bpb = val_bpb
+    min_val_loss = val_loss
 
 # Summary
 print0(f"Peak memory: {get_max_memory() / 1024 / 1024:.2f} MiB")
