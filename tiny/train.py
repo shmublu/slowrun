@@ -827,8 +827,23 @@ while current_epoch <= args.num_epochs:
 
     # Update optimizer
     lrm = get_lr_multiplier(step)
+    # WD schedule: 0.8 for 2ep → decay to 0.1 by ep8 → ramp to 1.25 linearly till end
+    steps_per_epoch = num_iterations // args.num_epochs
+    wd_phase1_end = 2 * steps_per_epoch
+    wd_phase2_end = 8 * steps_per_epoch
+    if step <= wd_phase1_end:
+        wd_scale = 1.0
+    elif step <= wd_phase2_end:
+        progress = (step - wd_phase1_end) / (wd_phase2_end - wd_phase1_end)
+        wd_scale = 1.0 - 0.875 * progress  # 1.0 → 0.125 (0.8→0.1)
+    else:
+        progress = (step - wd_phase2_end) / (num_iterations - wd_phase2_end)
+        wd_scale = 0.125 + (1.5625 - 0.125) * min(progress, 1.0)  # 0.125 → 1.5625 (0.1→1.25)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
+        if "initial_wd" not in group:
+            group["initial_wd"] = group.get("weight_decay", 0.0)
+        group["weight_decay"] = group["initial_wd"] * wd_scale
         if group['kind'] == 'muon':
             group["momentum"] = get_muon_momentum(step)
     optimizer.step()
