@@ -82,6 +82,7 @@ The tiny track caps runs at a single 8xH100 node for at most 15 minutes.
 7 | 3.089 | Ensemble of 10 models, looping of layers 15-20, tuned epoch counts, loss weight | 03/13/26 | 19h 18m (2 nodes, 8xH100) | [Script](https://github.com/qlabs-eng/slowrun/blob/5c6ecd540cd789eef50fe894302da82b670fcc93/unlimited/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
 8 | 3.081 | Ensemble of 12 models, distill alpha 0.5 | 03/18/26 | 42h 35m (1 node, 8xH100) | [Script](https://github.com/qlabs-eng/slowrun/blob/7dc6c386ae6ccf8bc8fa9b03cc53acf7723c4084/unlimited/train.py) | [@not-nonymous](https://github.com/not-nonymous)
 9 | 3.045 | More looping, hyperparam tuning, model size increase | 03/19/26 | ~44h (2 nodes, 8xH100) | [Script](https://github.com/qlabs-eng/slowrun/blob/fcfb67b230afcf2e1702936abc077defcf5f8657/unlimited/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
+10 | 3.024 | Use probability averaging over logit averaging, train 20 models | 03/31/26 | 210 hours (7xH100 node) | [Script](https://github.com/qlabs-eng/slowrun/blob/dceb3e9d5b6153058b8dadf36af84f6a7c622fdf/unlimited/train.py) | [@L-z-Chen](https://x.com/lzchen_ut)
 
 
 
