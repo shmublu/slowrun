@@ -59,7 +59,7 @@ parser.add_argument("--save-result", type=str, default="")
 parser.add_argument("--n_layer", type=int, default=16)
 parser.add_argument("--n_head", type=int, default=8)
 parser.add_argument("--n_embd", type=int, default=1024)
-parser.add_argument("--lr_multiplier", type=float, default=1.0)
+parser.add_argument("--lr_multiplier", type=float, default=0.8)
 parser.add_argument("--input_bin", type=str, default=None)
 parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
@@ -67,6 +67,8 @@ parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
 parser.add_argument("--update-ema-every", type=int, default=10)
 parser.add_argument("--ema-decay-per-epoch", type=float, default=0.15)
+parser.add_argument("--swa-last-epochs", type=int, default=4,
+                    help="SWA: cosine-cycle LR in last N epochs for checkpoint diversity (0=off)")
 args = parser.parse_args()
 
 # Resolve output path
@@ -829,6 +831,8 @@ param_ema_beta = args.ema_decay_per_epoch ** (args.update_ema_every / steps_per_
 ema_params = [torch.zeros_like(p) for p in model.parameters()] if args.update_ema_every > 0 else None
 
 wall_clock_start = time.time()
+_swa_start_step = (num_iterations - args.swa_last_epochs * steps_per_epoch) if args.swa_last_epochs > 0 else -1
+late_ckpt_paths = []
 
 # Initial val evaluation
 model.eval()
@@ -854,6 +858,11 @@ while current_epoch <= args.num_epochs:
 
     # Update optimizer
     lrm = get_lr_multiplier(step)
+    # SWA: cosine-cycle LR in final epochs for diverse checkpoints to average
+    if _swa_start_step >= 0 and step >= _swa_start_step:
+        cycle_pos = (step - _swa_start_step) % steps_per_epoch
+        swa_base = max(lrm, 0.05)
+        lrm = 0.05 + (swa_base - 0.05) * (1 + math.cos(math.pi * cycle_pos / steps_per_epoch)) / 2
     # WD schedule:
     #   [0, wd_phase1_end_step]:              hold at weight_decay
     #   [wd_phase1_end_step, wd_phase2_end_step]: decay to wd_mid
@@ -909,6 +918,15 @@ while current_epoch <= args.num_epochs:
             val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Epoch {current_epoch} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
         wandb_run.log({"step": step, "epoch": current_epoch, "val/bpb": val_bpb, "val/loss": val_loss})
+        # Save checkpoint for weight averaging
+        ckpt_path = os.path.join("tiny_ckpts", f"epoch_{current_epoch:03d}.pt")
+        if master_process:
+            os.makedirs("tiny_ckpts", exist_ok=True)
+            torch.save({n: p.data.float().cpu() for n, p in orig_model.named_parameters()}, ckpt_path)
+        late_ckpt_paths.append(ckpt_path)
+        if len(late_ckpt_paths) > args.swa_last_epochs:
+            old = late_ckpt_paths.pop(0)
+            if master_process and os.path.exists(old): os.remove(old)
         # Early stopping
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -919,6 +937,7 @@ while current_epoch <= args.num_epochs:
             if args.patience >= 0 and epochs_without_improvement >= args.patience:
                 print0(f"Early stopping: no improvement for {args.patience} epoch(s)")
                 break
+
         model.train()
         current_epoch = epoch
 
@@ -945,6 +964,30 @@ if ema_params is not None:
         if ema_bpb < min_val_bpb:
             min_val_bpb = ema_bpb
             min_val_loss = ema_loss
+
+# Checkpoint weight averaging (recency-weighted)
+if len(late_ckpt_paths) >= 2:
+    if ddp: dist.barrier()
+    n = len(late_ckpt_paths)
+    raw_w = list(range(1, n + 1))
+    weights = [w / sum(raw_w) for w in raw_w]
+    if master_process:
+        ckpts = [torch.load(p, map_location="cpu", weights_only=True) for p in late_ckpt_paths]
+        merged = {name: sum(w * ckpts[i][name].float() for i, w in enumerate(weights)) for name in ckpts[0]}
+        with torch.no_grad():
+            for name, p in orig_model.named_parameters():
+                if name in merged: p.copy_(merged[name].to(p.device, p.dtype))
+    if ddp:
+        dist.barrier()
+        for p in orig_model.parameters(): dist.broadcast(p.data, src=0)
+    model.eval()
+    val_loader = build_val_loader()
+    with autocast_ctx:
+        avg_bpb, avg_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+    print0(f"Ckpt avg Val BPB: {avg_bpb:.6f} | Val Loss: {avg_loss:.6f}")
+    wandb_run.log({"ckpt_avg/bpb": avg_bpb, "ckpt_avg/loss": avg_loss})
+    if avg_loss < min_val_loss:
+        min_val_loss, min_val_bpb = avg_loss, avg_bpb
 
 # Summary
 wall_clock_time = time.time() - wall_clock_start
