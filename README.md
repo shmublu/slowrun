@@ -98,15 +98,15 @@ The bitter lesson tells us that we should strongly prefer algorithms that scale 
 
 This repo builds on [Nanochat](https://github.com/karpathy/nanochat), which took many ideas from the modded-nanogpt speedrun contest. To be fair, the speedrun contest did provide real data efficiency gains: using less data is one way to train faster. But because it sets speed as the binding constraint, it filters out an entire class of algorithms that yield learning gains. 
 
-## Baseline Approach 
+## Initial Baseline Approach (02/26/26)
 
-Following Kim et al. (2025),[^2] we developed the baseline in three steps:
+Following Kim et al. (2025),[^2] we developed the initial baseline in three steps:
 
 1. **Optimizer selection.** We tested popular optimizers in the data-limited regime, training for multiple epochs on the 100M tokens. Muon outperforms AdamW, SOAP, and MAGMA.
 
 2. **Scaling up.** We increased model size but found diminishing returns due to the limited data. Without appropriate regularization, a 1.4B parameter model outperforms a 2.7B parameter model.
 
-3. **Regularization.** When we scale up parameter size also using heavy weight decay, we recover monotonic improvements with scale. We further find that dropout improves performance on top of weight decay. Our final model is a 2.7B parameter transformer, with 1.2B parameters in the transformer trunk and heavy embedding defaults from Nanochat. It is trained with dropout 0.1 and weight decay 1.6. This weight decay is very large by traditional standards, but consistent with Kim et al. (2025), who find optimal weight decay is up to 30× larger than standard practice in the data-constrained regime.
+3. **Regularization.** When we scale up parameter size also using heavy weight decay, we recover monotonic improvements with scale. We further find that dropout improves performance on top of weight decay. Our final model[^3] is a 2.7B parameter transformer, with 1.2B parameters in the transformer trunk and heavy embedding defaults from Nanochat. It is trained with dropout 0.1 and weight decay 1.6. This weight decay is very large by traditional standards, but consistent with Kim et al. (2025), who find optimal weight decay is up to 30× larger than standard practice in the data-constrained regime.
 
 Given the strong performance by large models that are well regularized, we speculate that larger models have a strong simplicity bias, amplified by regularization.
 
@@ -121,3 +121,4 @@ We choose 100M tokens because it is small enough to affordably try radically dif
 
 [^2]: Konwoo Kim, Suhas Kotha, Percy Liang, and Tatsunori Hashimoto. ["Pre-training under infinite compute."](https://arxiv.org/abs/2509.14786) arXiv:2509.14786, 2025.
 
+[^3]: These numbers from 02/26/26 are no longer accurate as of the latest world records. As of 04/08/26, the world record on the 1 hour track uses a 1.4B parameter model.
