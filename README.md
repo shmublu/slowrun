@@ -7,12 +7,13 @@ NanoGPT Slowrun is a new benchmark for language modeling algorithms in the infin
 
 When speed is not the binding constraint, the space of promising algorithms changes dramatically--for example, large models trained with heavy regularization, expensive optimizers, and evolutionary search are all fair game. We want leaps like GPT-3, where previously unimaginable compute led to better generalization. That doesn't happen if wall-clock time is your constraint.
 
-The baseline trains in \~47 minutes on 8xH100 (\~$12) and achieves 3.402 val loss. There are three tracks: 
+The baseline trains in \~47 minutes on 8xH100 (\~$12) and achieves 3.402 val loss. There are four tracks: 
 1. a limited compute track capped at a single 8xH100 node for 1 hour (this is 100x the compute used by the Nanochat 1-epoch baseline),
 2. a tiny compute track capped at a single 8xH100 node for 15 minutes,
-3. and an unlimited compute track with minimal restrictions on hardware or time. 
+3. a two hour track capped at a single 8xH100 node for two hours,
+4. and an unlimited compute track with minimal restrictions on hardware or time. 
 
-For now the limited track lives in the root directory, the tiny track lives at [tiny/](tiny/), and the unlimited track lives at [unlimited/](unlimited/). Submit an entry by opening a PR.
+For now the limited track lives in the root directory, the tiny track lives at [tiny/](tiny/), the two hour track lives at [two_hour/](two_hour/), and the unlimited track lives at [unlimited/](unlimited/). The approaches pursued vary significantly based on the compute budget. Submit an entry by opening a PR.
 
 ## Running the current record 
 
@@ -70,8 +71,13 @@ The tiny track caps runs at a single 8xH100 node for at most 15 minutes.
 
 
 
+### Two hour track
 
+The two hour track caps runs at a single 8xH100 node for at most two hours.
 
+| # | Val Loss | Description | Date | Time | Script | Contributors |
+| - | - | - | - | - | - | - |
+1 | 3.203 | Baseline, extending the 1 hour multi token prediction result | 04/12/26 | 110.6 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/7f7b417c4ea5abc9c63eb2e43495d66a1646fa11/two_hour/train.py) | [@ChinmayK0607](https://x.com/ChinmayKak)
 
 
 ### Unlimited Compute Track 
