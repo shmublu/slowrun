@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from contextlib import nullcontext
 
 import torch
+import torch._dynamo
+torch._dynamo.config.cache_size_limit = 64
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -39,10 +41,10 @@ parser.add_argument("--patience", type=int, default=-1)
 parser.add_argument("--run", type=str, default=None)
 parser.add_argument("--scalar-lr", type=float, default=0.1)
 parser.add_argument("--matrix-lr", type=float, default=0.04)
-parser.add_argument("--weight-decay", type=float, default=0.6)
+parser.add_argument("--weight-decay", type=float, default=0.8)
 parser.add_argument("--total-batch-size", type=int, default=524288)
 parser.add_argument("--save-result", type=str, default="")
-parser.add_argument("--n-layer-schedule", type=str, default="0:12,1533:24",
+parser.add_argument("--n-layer-schedule", type=str, default="0:10,1533:20",
                     help="Comma-separated depth schedule in step:n_layer format, must start at step 0")
 parser.add_argument("--n_head", type=int, default=16)
 parser.add_argument("--n_embd", type=int, default=2048)
@@ -52,6 +54,8 @@ parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
+parser.add_argument("--stoch-depth", type=float, default=0.05,
+                    help="Stochastic depth max drop rate (linear schedule, 0=off)")
 parser.add_argument("--warmdown-ratio", type=float, default=None,
                     help="Override warmdown ratio")
 parser.add_argument("--logit-cap", type=float, default=10.0,
@@ -65,6 +69,12 @@ parser.add_argument("--logit-avg-mode", type=str, default="both",
                     help="Weight scheme: equal, linear recency weighted, or compare both")
 parser.add_argument("--eval-logit-avg", action="store_true",
                     help="Skip training and only run logit-avg eval on saved checkpoints")
+parser.add_argument("--iha", action="store_true", default=True,
+                    help="Enable Interleaved Head Attention (cross-head Q/K/V mixing)")
+parser.add_argument("--no-iha", action="store_false", dest="iha",
+                    help="Disable IHA cross-head mixing")
+parser.add_argument("--iha-lr", type=float, default=0.02,
+                    help="LR for IHA mixing matrices")
 args = parser.parse_args()
 
 
@@ -204,6 +214,9 @@ class GPTConfig:
     n_embd: int = N_EMBD
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.0
+    stoch_depth: float = 0.05
+    use_iha: bool = False
+    iha_mix_v: bool = True
 
 class RMSNorm(nn.Module):
     def __init__(self, dim):
@@ -241,12 +254,34 @@ class SharedCausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.resid_dropout = nn.Dropout(config.dropout)
+        self.use_iha = config.use_iha
+        if self.use_iha:
+            self.q_mix = nn.Parameter(torch.zeros(self.n_head, self.n_head))
+            self.k_mix = nn.Parameter(torch.zeros(self.n_kv_head, self.n_kv_head))
+            self.iha_mix_v = config.iha_mix_v
+            if self.iha_mix_v:
+                self.v_mix = nn.Parameter(torch.zeros(self.n_kv_head, self.n_kv_head))
+
+    def _fuse_mix(self, weight, mix, num_heads):
+        d = self.head_dim
+        return (mix @ weight.view(num_heads, d, -1).flatten(1)).view_as(weight)
 
     def forward(self, x, ve, cos_sin, window_size, q_norm, k_norm, ve_gate=None, attn_gate=None):
         B, T, C = x.size()
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        if self.use_iha:
+            q = F.linear(x, self._fuse_mix(self.c_q.weight, self.q_mix, self.n_head))
+            q = q.view(B, T, self.n_head, self.head_dim)
+            k = F.linear(x, self._fuse_mix(self.c_k.weight, self.k_mix, self.n_kv_head))
+            k = k.view(B, T, self.n_kv_head, self.head_dim)
+            if self.iha_mix_v:
+                v = F.linear(x, self._fuse_mix(self.c_v.weight, self.v_mix, self.n_kv_head))
+                v = v.view(B, T, self.n_kv_head, self.head_dim)
+            else:
+                v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        else:
+            q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+            k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+            v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
         # Value residual (ResFormer)
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
@@ -276,15 +311,22 @@ class SharedMLP(nn.Module):
 class LayerBlock(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
-        self.attn_norm = RMSNorm(config.n_embd)
+        self.attn_norms = nn.ModuleList([RMSNorm(config.n_embd) for _ in range(2)])
         self.mlp_norm = RMSNorm(config.n_embd)
         head_dim = config.n_embd // config.n_head
-        self.q_norm = RMSNorm(head_dim)
-        self.k_norm = RMSNorm(head_dim)
+        self.q_norms = nn.ModuleList([RMSNorm(head_dim) for _ in range(2)])
+        self.k_norms = nn.ModuleList([RMSNorm(head_dim) for _ in range(2)])
         self.ve_gate_channels = 32
-        self.ve_gate = nn.Linear(self.ve_gate_channels, config.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
         self.attn_gate_channels = 12
-        self.attn_gate = nn.Linear(self.attn_gate_channels, config.n_head, bias=False)
+        has_value_embed = has_ve(layer_idx, config.n_layer)
+        self.ve_gates = nn.ModuleList([
+            nn.Linear(self.ve_gate_channels, config.n_kv_head, bias=False) if has_value_embed else nn.Identity()
+            for _ in range(2)
+        ])
+        self.attn_gates = nn.ModuleList([
+            nn.Linear(self.attn_gate_channels, config.n_head, bias=False) for _ in range(2)
+        ])
+        self.drop_prob = config.stoch_depth * (layer_idx / max(config.n_layer - 1, 1))
 
 
 class GPT(nn.Module):
@@ -300,8 +342,8 @@ class GPT(nn.Module):
         padded_vocab = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab}")
-        self.encoder_attn = SharedCausalSelfAttention(config)
-        self.decoder_attn = SharedCausalSelfAttention(config)
+        self.encoder_attns = nn.ModuleList([SharedCausalSelfAttention(config) for _ in range(2)])
+        self.decoder_attns = nn.ModuleList([SharedCausalSelfAttention(config) for _ in range(2)])
         self.encoder_mlp = SharedMLP(config)
         self.decoder_mlp = SharedMLP(config)
         self.transformer = nn.ModuleDict({
@@ -327,11 +369,16 @@ class GPT(nn.Module):
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         s = 3**0.5 * self.config.n_embd**-0.5
-        for attn in (self.encoder_attn, self.decoder_attn):
+        for attn in [*self.encoder_attns, *self.decoder_attns]:
             torch.nn.init.uniform_(attn.c_q.weight, -s, s)
             torch.nn.init.uniform_(attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(attn.c_proj.weight)
+            if attn.use_iha:
+                torch.nn.init.eye_(attn.q_mix)
+                torch.nn.init.eye_(attn.k_mix)
+                if attn.iha_mix_v:
+                    torch.nn.init.eye_(attn.v_mix)
         for mlp in (self.encoder_mlp, self.decoder_mlp):
             torch.nn.init.uniform_(mlp.c_gate.weight, -s, s)
             torch.nn.init.uniform_(mlp.c_fc.weight, -s, s)
@@ -341,17 +388,21 @@ class GPT(nn.Module):
         for proj in self.ve_projs.values():
             torch.nn.init.uniform_(proj.weight, -s, s)
         for block in self.transformer.h:
-            block.attn_norm.weight.fill_(1.0)
-            block.attn_norm.bias.zero_()
+            for attn_norm in block.attn_norms:
+                attn_norm.weight.fill_(1.0)
+                attn_norm.bias.zero_()
             block.mlp_norm.weight.fill_(1.0)
             block.mlp_norm.bias.zero_()
-            block.q_norm.weight.fill_(1.0)
-            block.q_norm.bias.zero_()
-            block.k_norm.weight.fill_(1.0)
-            block.k_norm.bias.zero_()
-            if block.ve_gate is not None:
-                torch.nn.init.zeros_(block.ve_gate.weight)
-            torch.nn.init.zeros_(block.attn_gate.weight)
+            for q_norm, k_norm in zip(block.q_norms, block.k_norms):
+                q_norm.weight.fill_(1.0)
+                q_norm.bias.zero_()
+                k_norm.weight.fill_(1.0)
+                k_norm.bias.zero_()
+            for ve_gate in block.ve_gates:
+                if isinstance(ve_gate, nn.Linear):
+                    torch.nn.init.zeros_(ve_gate.weight)
+            for attn_gate in block.attn_gates:
+                torch.nn.init.zeros_(attn_gate.weight)
         self.skip_weights.fill_(1.0)
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
@@ -394,7 +445,7 @@ class GPT(nn.Module):
     def estimate_flops(self): 
         # Counts effective params (recursion counted as multiple) which should be more accurate.
         # But not sure if the 6x multiplier still makes sense in this case.
-        shared_attn = sum(p.numel() for p in self.encoder_attn.parameters()) + sum(p.numel() for p in self.decoder_attn.parameters())
+        shared_attn = sum(p.numel() for p in self.encoder_attns.parameters()) + sum(p.numel() for p in self.decoder_attns.parameters())
         shared_mlp = sum(p.numel() for p in self.encoder_mlp.parameters()) + sum(p.numel() for p in self.decoder_mlp.parameters())
         active_layers = list(range(self.active_encoder_layers)) + list(range(self.active_decoder_start, self.max_n_layer))
         nparams = (
@@ -418,23 +469,36 @@ class GPT(nn.Module):
 
     def setup_optimizer(self):
         ddp, rank, local_rank, world_size = get_dist_info()
+        iha_params = []
+        iha_param_ids = set()
+        for attn in [*self.encoder_attns, *self.decoder_attns]:
+            if attn.use_iha:
+                iha_params.append(attn.q_mix)
+                iha_params.append(attn.k_mix)
+                iha_param_ids.add(id(attn.q_mix))
+                iha_param_ids.add(id(attn.k_mix))
+                if attn.iha_mix_v:
+                    iha_params.append(attn.v_mix)
+                    iha_param_ids.add(id(attn.v_mix))
         shared_params = (
-            [self.encoder_attn.c_q.weight, self.encoder_attn.c_k.weight, self.encoder_attn.c_v.weight, self.encoder_attn.c_proj.weight]
-            + [self.decoder_attn.c_q.weight, self.decoder_attn.c_k.weight, self.decoder_attn.c_v.weight, self.decoder_attn.c_proj.weight]
+            list(self.encoder_attns.parameters())
+            + list(self.decoder_attns.parameters())
             + list(self.encoder_mlp.parameters())
             + list(self.decoder_mlp.parameters())
         )
         layer_matrix_params = []
         norm_params = []
         for block in self.transformer.h:
-            layer_matrix_params.append(block.attn_gate.weight)
-            norm_params.extend(block.attn_norm.parameters())
+            for attn_gate in block.attn_gates:
+                layer_matrix_params.append(attn_gate.weight)
+            norm_params.extend(block.attn_norms.parameters())
             norm_params.extend(block.mlp_norm.parameters())
-            norm_params.extend(block.q_norm.parameters())
-            norm_params.extend(block.k_norm.parameters())
-            if block.ve_gate is not None:
-                layer_matrix_params.append(block.ve_gate.weight)
-        matrix_params = shared_params + layer_matrix_params + list(self.ve_projs.parameters())
+            norm_params.extend(block.q_norms.parameters())
+            norm_params.extend(block.k_norms.parameters())
+            for ve_gate in block.ve_gates:
+                if isinstance(ve_gate, nn.Linear):
+                    layer_matrix_params.append(ve_gate.weight)
+        matrix_params = [p for p in shared_params if id(p) not in iha_param_ids] + layer_matrix_params + list(self.ve_projs.parameters())
         ve_params = []
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -451,6 +515,8 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=SCALAR_LR, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=skip_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
         ]
+        if iha_params:
+            param_groups.append(dict(kind='adamw', params=iha_params, lr=args.iha_lr, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0))
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(kind='muon', params=group_params, lr=MATRIX_LR,
@@ -461,16 +527,26 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def _run_layer(self, x, x0, cos_sin, layer_idx, shared_attn, shared_mlp):
+    def _run_layer(self, x, x0, cos_sin, layer_idx, shared_attns, shared_mlp):
         block = self.transformer.h[layer_idx]
         x = self.resid_lambdas[layer_idx] * x + self.x0_lambdas[layer_idx] * x0
         ve = self.ve_projs[str(layer_idx)](x0) if str(layer_idx) in self.ve_projs else None
-        attn_input = block.attn_norm(x)
-        ve_gate = block.ve_gate(attn_input[..., :block.ve_gate_channels]) if block.ve_gate is not None else None
-        attn_gate = block.attn_gate(attn_input[..., :block.attn_gate_channels])
-        x = x + shared_attn(attn_input, ve, cos_sin, self.window_sizes[layer_idx], block.q_norm, block.k_norm, ve_gate=ve_gate, attn_gate=attn_gate)
+        x_in = x
+        for attn, attn_norm, q_norm, k_norm, ve_gate, attn_gate in zip(
+            shared_attns, block.attn_norms, block.q_norms, block.k_norms, block.ve_gates, block.attn_gates
+        ):
+            attn_input = attn_norm(x)
+            ve_gate_out = ve_gate(attn_input[..., :block.ve_gate_channels]) if isinstance(ve_gate, nn.Linear) else None
+            attn_gate_out = attn_gate(attn_input[..., :block.attn_gate_channels])
+            x = x + attn(
+                attn_input, ve, cos_sin, self.window_sizes[layer_idx], q_norm, k_norm,
+                ve_gate=ve_gate_out, attn_gate=attn_gate_out
+            )
         mlp_input = block.mlp_norm(x)
         x = x + shared_mlp(mlp_input)
+        if self.training and block.drop_prob > 0:
+            keep = (torch.rand((), device=x.device) >= block.drop_prob).to(x.dtype)
+            x = x_in + keep * (x - x_in)
         return x
 
     def _run_decoder_layers(self, x, x0, cos_sin, encoder_outputs, start, end):
@@ -480,7 +556,7 @@ class GPT(nn.Module):
             j = self.max_n_layer - 1 - i
             if 0 <= j < len(encoder_outputs):
                 x = x + self.skip_weights[i - self.max_encoder_layers] * encoder_outputs[j]
-            x = self._run_layer(x, x0, cos_sin, i, self.decoder_attn, self.decoder_mlp)
+            x = self._run_layer(x, x0, cos_sin, i, self.decoder_attns, self.decoder_mlp)
         return x
 
     def forward(self, idx, targets=None, loss_reduction='mean'):
@@ -492,7 +568,7 @@ class GPT(nn.Module):
         # Encoder half: run layers and collect outputs for skip connections
         encoder_outputs = []
         for i in range(self.active_encoder_layers):
-            x = self._run_layer(x, x0, cos_sin, i, self.encoder_attn, self.encoder_mlp)
+            x = self._run_layer(x, x0, cos_sin, i, self.encoder_attns, self.encoder_mlp)
             encoder_outputs.append(x)
 
         # Decoder half
@@ -909,6 +985,9 @@ print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
+print0(f"  stoch_depth={args.stoch_depth}")
+if args.iha:
+    print0(f"  iha=True, iha_lr={args.iha_lr}")
 print0(f"-----------------------")
 
 # Load GPT-2 tokenizer and compute token_bytes for BPB evaluation
@@ -926,7 +1005,9 @@ for i in range(vocab_size):
 token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 
 # Build model
-config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout)
+config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout,
+                   stoch_depth=args.stoch_depth,
+                   use_iha=args.iha, iha_mix_v=args.iha)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
@@ -935,8 +1016,8 @@ model.init_weights()
 param_counts = sum(p.numel() for p in model.parameters())
 transformer_params = (
     sum(p.numel() for p in model.transformer.h.parameters())
-    + sum(p.numel() for p in model.encoder_attn.parameters())
-    + sum(p.numel() for p in model.decoder_attn.parameters())
+    + sum(p.numel() for p in model.encoder_attns.parameters())
+    + sum(p.numel() for p in model.decoder_attns.parameters())
     + sum(p.numel() for p in model.encoder_mlp.parameters())
     + sum(p.numel() for p in model.decoder_mlp.parameters())
 )
